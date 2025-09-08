@@ -1,0 +1,441 @@
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+import trimesh
+from sklearn.cluster import KMeans
+import numpy as np
+import torch.nn.functional as F
+import trimesh.transformations as tf
+import json
+import pickle
+import tempfile
+from scipy.spatial.distance import cdist
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+# ---------- helpers: clustering like your first code ----------
+def compute_cluster_centroids(vertices, labels, n_clusters):
+    centroids = np.zeros((n_clusters, 3), dtype=np.float64)
+    counts = np.zeros(n_clusters, dtype=np.int64)
+    for i, v in enumerate(vertices):
+        c = labels[i]
+        centroids[c] += v
+        counts[c] += 1
+    counts = np.maximum(counts, 1)  # avoid divide-by-zero
+    centroids /= counts[:, None]
+    return centroids
+
+def reorder_clusters_by_proximity(centroids):
+    if len(centroids) <= 1:
+        return list(range(len(centroids)))
+    dist_matrix = cdist(centroids, centroids, metric='euclidean')
+    mst = minimum_spanning_tree(dist_matrix).toarray()
+    mst[mst == 0] = np.inf
+    visited, ordered = set(), []
+    def dfs(u):
+        if u in visited: return
+        visited.add(u); ordered.append(u)
+        for v in np.argsort(mst[u]):
+            if v not in visited and np.isfinite(mst[u, v]):
+                dfs(v)
+    for i in range(len(centroids)):
+        dfs(i)
+    if len(ordered) < len(centroids):
+        remaining = set(range(len(centroids))) - set(ordered)
+        remaining = sorted(remaining, key=lambda x: np.min(dist_matrix[x, ordered]))
+        ordered.extend(remaining)
+    return ordered
+
+
+class MeshAugmentation:
+    """
+    Applies random augmentations to a mesh (geometry) or to feature tensors (post-cache).
+    Args:
+        rotation_range (float): Maximum rotation angle in degrees.
+        scale_range (tuple): Min and max scaling factors.
+        noise_std (float): Standard deviation of Gaussian noise (for mesh or features).
+        flip_probability (float): Probability of flipping the mesh.
+        feature_noise_std (float): Standard deviation of noise for feature tensors.
+    """
+    def __init__(self, rotation_range=15, scale_range=(0.9, 1.1), noise_std=0.01, flip_probability=0.5, feature_noise_std=0.01):
+        self.rotation_range = rotation_range
+        self.scale_range = scale_range
+        self.noise_std = noise_std
+        self.flip_probability = flip_probability
+        self.feature_noise_std = feature_noise_std
+
+    def __call__(self, mesh, mode='RSN'):
+        """
+        Applies augmentations to the mesh geometry.
+        Args:
+            mesh (trimesh.Trimesh): The mesh to augment.
+            mode (str): Which augmentations to apply ('R'=rotation, 'S'=scaling, 'N'=noise, 'F'=flip).
+        Returns:
+            mesh (trimesh.Trimesh): The augmented mesh.
+        """
+        # Apply flipping (if enabled and randomly selected)
+        if 'F' in mode and np.random.rand() < 0.5:
+            if np.random.rand() < self.flip_probability:
+                mesh.invert()
+
+        # Apply rotation (if enabled and randomly selected)
+        if 'R' in mode and np.random.rand() < 0.5:
+            angle = np.random.uniform(-self.rotation_range, self.rotation_range)
+            axis = np.random.randn(3)
+            axis /= np.linalg.norm(axis)
+            rotation_matrix = trimesh.transformations.rotation_matrix(
+                angle=angle, 
+                direction=axis, 
+                point=mesh.centroid
+            )
+            mesh.apply_transform(rotation_matrix)
+
+        # Apply scaling (if enabled and randomly selected)
+        if 'S' in mode and np.random.rand() < 0.5:
+            scaling_matrix = tf.scale_matrix(self.scale_range)
+            mesh.apply_transform(scaling_matrix)
+
+        # Apply noise (if enabled and randomly selected)
+        if 'N' in mode and np.random.rand() < 0.5:
+            noise = np.random.randn(*mesh.vertices.shape) * self.noise_std
+            mesh.vertices += noise
+
+        return mesh
+
+    def augment_features(self, features):
+        """
+        Applies augmentation to feature tensors (post-cache).
+        Args:
+            features (torch.Tensor): The input features tensor.
+        Returns:
+            torch.Tensor: Augmented features.
+        """
+        if not torch.is_tensor(features):
+            features = torch.tensor(features)
+        noise = torch.randn_like(features) * self.feature_noise_std
+        return features + noise
+
+
+
+class MeshDataset(Dataset):
+    """
+    PyTorch Dataset for loading 3D mesh data, labels, and optional features, with clustering and augmentation.
+    Args:
+        mesh_dir (str): Directory with mesh files (.obj or .ply).
+        label_dir (str): Directory with label files (.txt).
+        n_clusters (int): Number of clusters for K-Means.
+        clusters_per_batch (int): Number of clusters per batch.
+        PE (bool): Whether to use positional encoding.
+        json_dir (str, optional): Directory with JSON feature files.
+        augmentation (callable, optional): Augmentation function to apply to meshes.
+        transform (callable, optional): Optional transform to apply to samples.
+    """
+    def __init__(self, mesh_dir, label_dir, n_clusters, clusters_per_batch, PE, json_dir=None, augmentation=None, transform=None):
+        self.mesh_dir = mesh_dir
+        self.label_dir = label_dir
+        self.json_dir = json_dir
+        self.mesh_files = [f for f in os.listdir(mesh_dir) if f.endswith('.obj') or f.endswith('.ply')]
+        self.n_clusters = n_clusters
+        self.clusters_per_batch = clusters_per_batch
+        self.transform = transform
+        self.PE = PE
+        self.augmentation = augmentation
+
+        # Caching setup
+        self.cache_dir = os.path.join(mesh_dir, ".cluster_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._in_memory_cache = {}  # mesh_path -> payload
+
+        # Verify the label directory exists
+        if not os.path.isdir(label_dir):
+            raise FileNotFoundError(f"The label directory {label_dir} does not exist.")
+
+        # Verify the JSON directory exists if provided
+        if json_dir and not os.path.isdir(json_dir):
+            raise FileNotFoundError(f"The json directory {json_dir} does not exist.")
+
+        # Load labels
+        self.labels = self.load_labels()
+        print(f"Found {len(self.mesh_files)} mesh files")
+
+    def load_labels(self):
+        """
+        Loads the labels for each mesh file.
+        Returns:
+            labels (dict): Mapping from mesh base name to list of face labels.
+        """
+        labels = {}
+        print(f"Loading labels from {self.label_dir}...")
+        for file_name in os.listdir(self.label_dir):
+            if file_name.endswith('.txt'):
+                base_name = os.path.splitext(file_name)[0]
+                with open(os.path.join(self.label_dir, file_name), 'r') as f:
+                    labels[base_name] = [int(x) for x in f.read().split()]
+        print(f"Loaded labels for {len(labels)} files.")
+        return labels
+
+    def load_json_features(self, base_name):
+        """
+        Loads additional features from the JSON file for the given mesh.
+        Args:
+            base_name (str): Base name of the mesh file (without extension).
+        Returns:
+            json_features (dict or None): Loaded JSON features or None if not found.
+        """
+        if self.json_dir:
+            json_file_path = os.path.join(self.json_dir, base_name + '.json')
+            if os.path.isfile(json_file_path):
+                with open(json_file_path, 'r') as f:
+                    json_features = json.load(f)
+                return json_features
+        return None
+
+    def _compute_and_cache(self, mesh_path, label_file_name):
+        mesh = trimesh.load(mesh_path, force='mesh')
+        vertices = mesh.vertices
+        faces = mesh.faces
+
+        # Normalize coordinates to the range [0, 1]
+        min_coords = vertices.min(axis=0)
+        max_coords = vertices.max(axis=0)
+        normalized_vertices = (vertices - min_coords) / (max_coords - min_coords)
+        face_labels = self.labels[label_file_name]
+        if len(face_labels) != len(faces):
+            raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_path}")
+
+        # Remove duplicate faces
+        seen = set()
+        unique_faces = []
+        unique_face_labels = []
+        unique_face_indices = []
+        for face_idx, face in enumerate(faces):
+            face_tuple = tuple(face)
+            if face_tuple not in seen:
+                seen.add(face_tuple)
+                unique_faces.append(face)
+                unique_face_labels.append(face_labels[face_idx])
+                unique_face_indices.append(face_idx)
+        faces = np.array(unique_faces)
+        face_labels = unique_face_labels
+        unique_faces = np.array(unique_faces)
+
+        # KMeans clustering on vertices
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init='auto')
+        labels = kmeans.fit_predict(vertices)
+        
+        # Compute cluster centroids and reorder for consistency
+        centroids = compute_cluster_centroids(vertices, labels, self.n_clusters)
+        reorder_indices = reorder_clusters_by_proximity(centroids)
+        
+        # Reorder clusters based on proximity
+        clusters = [[] for _ in range(self.n_clusters)]
+        for face in faces:
+            face_cluster = labels[face]
+            most_common_cluster = np.bincount(face_cluster).argmax()
+            # Map to reordered cluster index
+            reordered_cluster = reorder_indices[most_common_cluster]
+            clusters[reordered_cluster].append(face)
+
+        mesh_normals = mesh.face_normals[unique_face_indices]
+        mesh_area = mesh.area_faces[unique_face_indices]
+        mesh_angle = mesh.face_angles[unique_face_indices]
+        min_angle = mesh_angle.min()
+        max_angle = mesh_angle.max()
+        mesh_angle = (mesh_angle - min_angle) / (max_angle - min_angle)
+        min_area = mesh_area.min()
+        max_area = mesh_area.max()
+        mesh_area = (mesh_area - min_area) / (max_area - min_area)
+        precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+        face_to_index = {tuple(face): i for i, face in enumerate(faces)}
+
+        payload = {
+            'clusters': clusters,
+            'mesh_angle': mesh_angle,
+            'mesh_normals': mesh_normals,
+            'mesh_area': mesh_area,
+            'precomputed_coords': precomputed_coords,
+            'face_to_index': face_to_index,
+            'face_labels': face_labels
+        }
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}.pkl"
+        )
+        fd, tmp_path = tempfile.mkstemp(dir=self.cache_dir)
+        with os.fdopen(fd, 'wb') as tmpf:
+            pickle.dump(payload, tmpf)
+        os.replace(tmp_path, cache_file)
+        self._in_memory_cache[mesh_path] = payload
+
+    def __len__(self):
+        """
+        Returns the number of samples in the dataset.
+        Returns:
+            length (int): Number of mesh samples (mesh files * cluster batches per mesh).
+        """
+        return len(self.mesh_files) * (self.n_clusters // self.clusters_per_batch)
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        mesh_idx = idx // (self.n_clusters // self.clusters_per_batch)
+        cluster_batch_idx = idx % (self.n_clusters // self.clusters_per_batch)
+        mesh_file = self.mesh_files[mesh_idx]
+        mesh_path = os.path.join(self.mesh_dir, mesh_file)
+        label_file_name = os.path.splitext(mesh_file)[0]
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}.pkl"
+        )
+        use_cache = self.augmentation is None  # Only cache un-augmented
+        if use_cache:
+            if mesh_path not in self._in_memory_cache:
+                if os.path.exists(cache_file):
+                    try:
+                        with open(cache_file, 'rb') as f:
+                            payload = pickle.load(f)
+                        if not isinstance(payload, dict):
+                            raise ValueError(f"cache payload is {type(payload)}")
+                        self._in_memory_cache[mesh_path] = payload
+                        print(f"[CACHE] Loaded mesh {os.path.basename(mesh_path)} from cache.")
+                    except (EOFError, pickle.UnpicklingError, ValueError):
+                        os.remove(cache_file)
+                        self._compute_and_cache(mesh_path, label_file_name)
+                        print(f"[CACHE] Cache for {os.path.basename(mesh_path)} was corrupted or invalid. Recomputed and cached.")
+                else:
+                    self._compute_and_cache(mesh_path, label_file_name)
+                    print(f"[CACHE] No cache found for {os.path.basename(mesh_path)}. Computed and cached.")
+            else:
+                print(f"[CACHE] Used in-memory cache for {os.path.basename(mesh_path)}.")
+            cache = self._in_memory_cache[mesh_path]
+            clusters = cache['clusters']
+            mesh_angle = cache['mesh_angle']
+            mesh_normals = cache['mesh_normals']
+            mesh_area = cache['mesh_area']
+            precomputed_coords = cache['precomputed_coords']
+            face_to_index = cache['face_to_index']
+            face_labels = cache['face_labels']
+        else:
+            # If augmentation is used, recompute on the fly
+            mesh = trimesh.load(mesh_path, force='mesh')
+            if self.augmentation and np.random.rand() < 0.2:
+                mesh = self.augmentation(mesh)
+            print(f"[CACHE] Augmentation enabled or requested. Mesh {os.path.basename(mesh_path)} computed on the fly (not cached).")
+            vertices = mesh.vertices
+            faces = mesh.faces
+            min_coords = vertices.min(axis=0)
+            max_coords = vertices.max(axis=0)
+            normalized_vertices = (vertices - min_coords) / (max_coords - min_coords)
+            face_labels = self.labels[label_file_name]
+            if len(face_labels) != len(faces):
+                raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_file}")
+            seen = set()
+            unique_faces = []
+            unique_face_labels = []
+            unique_face_indices = []
+            for face_idx, face in enumerate(faces):
+                face_tuple = tuple(face)
+                if face_tuple not in seen:
+                    seen.add(face_tuple)
+                    unique_faces.append(face)
+                    unique_face_labels.append(face_labels[face_idx])
+                    unique_face_indices.append(face_idx)
+            faces = np.array(unique_faces)
+            face_labels = unique_face_labels
+            unique_faces = np.array(unique_faces)
+            kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init='auto')
+            labels = kmeans.fit_predict(vertices)
+            
+            # Compute cluster centroids and reorder for consistency
+            centroids = compute_cluster_centroids(vertices, labels, self.n_clusters)
+            reorder_indices = reorder_clusters_by_proximity(centroids)
+            
+            # Reorder clusters based on proximity
+            clusters = [[] for _ in range(self.n_clusters)]
+            for face in faces:
+                face_cluster = labels[face]
+                most_common_cluster = np.bincount(face_cluster).argmax()
+                # Map to reordered cluster index
+                reordered_cluster = reorder_indices[most_common_cluster]
+                clusters[reordered_cluster].append(face)
+            mesh_normals = mesh.face_normals[unique_face_indices]
+            mesh_area = mesh.area_faces[unique_face_indices]
+            mesh_angle = mesh.face_angles[unique_face_indices]
+            min_angle = mesh_angle.min()
+            max_angle = mesh_angle.max()
+            mesh_angle = (mesh_angle - min_angle) / (max_angle - min_angle)
+            min_area = mesh_area.min()
+            max_area = mesh_area.max()
+            mesh_area = (mesh_area - min_area) / (max_area - min_area)
+            precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+            face_to_index = {tuple(face): i for i, face in enumerate(faces)}
+        start_cluster = cluster_batch_idx * self.clusters_per_batch
+        end_cluster = start_cluster + self.clusters_per_batch
+        selected_clusters = clusters[start_cluster:end_cluster]
+        nested_list_faces = []
+        nested_list_labels = []
+        for cluster in selected_clusters:
+            cluster_list_faces = []
+            cluster_list_labels = []
+            for face in cluster:
+                face_features = []
+                face_idx = face_to_index[tuple(face)]
+                if self.PE:
+                    coords = precomputed_coords[face_idx]
+                    face_features.append(coords)
+                face_features.append(mesh_angle[face_idx])
+                face_features.append(mesh_normals[face_idx])
+                face_features = np.concatenate(face_features).tolist()
+                face_features.append(mesh_area[face_idx])
+                label = face_labels[face_idx]
+                cluster_list_faces.append(face_features)
+                cluster_list_labels.append(label)
+            if cluster_list_faces:
+                feats_tensor = torch.tensor(np.array(cluster_list_faces))
+                # ---- POST-CACHE AUGMENTATION ----
+                if self.augmentation is not None:
+                    feats_tensor = self.augmentation(feats_tensor)
+                # ---------------------------------
+                nested_list_faces.append(feats_tensor)
+                nested_list_labels.append(torch.tensor(np.array(cluster_list_labels)))
+        if self.transform:
+            nested_list_faces = self.transform(nested_list_faces)
+            nested_list_labels = self.transform(nested_list_labels)
+        return nested_list_faces, nested_list_labels
+
+
+# Custom collate function to handle varying sizes of vertices and faces
+def custom_collate_fn(batch):
+    """
+    Pads and stacks a batch of mesh data with varying sizes for use in a DataLoader.
+    Args:
+        batch (list): List of tuples (nested_list_faces, nested_list_labels) from MeshDataset.__getitem__.
+    Returns:
+        padded_batches (Tensor): Batched and padded face features, shape (B, P, S, F).
+        padded_labels (Tensor): Batched and padded labels, shape (B, P, L).
+        masks (Tensor): Mask tensor indicating valid entries, shape (B, P, S).
+    """
+    max_patch_size = max(len(item[0]) for item in batch)
+    max_sequence_length = max(max(patch.size(0) for patch in item[0]) for item in batch)
+    max_label_length = max(max(patch.size(0) for patch in item[1]) for item in batch)
+    
+    padded_batches = []
+    padded_labels = []
+    masks = []
+
+    for data, label in batch:
+        padded_data = [F.pad(patch, (0, 0, 0, max_sequence_length - patch.size(0))) for patch in data]
+        padded_data += [torch.zeros(max_sequence_length, data[0].size(1))] * (max_patch_size - len(data))
+        padded_batches.append(torch.stack(padded_data))
+        
+        padded_label = [F.pad(patch, (0, max_label_length - patch.size(0))) for patch in label]
+        padded_label += [torch.zeros(max_label_length)] * (max_patch_size - len(label))
+        padded_labels.append(torch.stack(padded_label))
+        
+        batch_mask = torch.zeros((max_patch_size, max_sequence_length), dtype=torch.bool)
+        for i, patch in enumerate(data):
+            batch_mask[i, :patch.size(0)] = 1
+        masks.append(batch_mask)
+        
+    return torch.stack(padded_batches), torch.stack(padded_labels), torch.stack(masks)
+
+

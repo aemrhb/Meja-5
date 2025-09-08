@@ -1,0 +1,54 @@
+# Example configuration file for downstream training
+# This shows how to configure weight decay and other training parameters
+
+paths:
+  mesh_dir: "path/to/training/meshes"
+  label_dir: "path/to/training/labels"
+  json_dir: "path/to/training/json"
+  log_dir: "path/to/logs"
+  checkpoint_dir: "path/to/checkpoints"
+  checkpoint_pertrain: "path/to/pretrained/checkpoint.pth"
+  val_mesh_dir: "path/to/validation/meshes"
+  val_label_dir: "path/to/validation/labels"
+  val_json_dir: "path/to/validation/json"
+
+training:
+  epochs: 100
+  batch_size: 8
+  clusters_per_batch: 64
+  accumulation_steps: 1
+  resume: false
+  use_pretrained: true
+  num_unfrozen_encoder_layers: 2
+  weight_decay: 1e-4  # New configurable weight decay option
+  # Other weight decay values you can try:
+  # weight_decay: 1e-3    # Stronger regularization
+  # weight_decay: 1e-5    # Weaker regularization
+  # weight_decay: 0.0     # No weight decay
+
+model:
+  feature_dim: 64
+  embedding_dim: 256
+  num_heads: 8
+  num_attention_blocks: 6
+  n_classes: 12
+  n_clusters: 64
+  use_pe: true
+  gradinat_ac: true
+  dropout: 0.1
+
+augmentation:
+  rotation_range: 30
+  scale_range: [0.8, 1.2]
+  noise_std: 0.01
+  flip_probability: 0.5
+  mode: "train"
+
+optimizer:
+  type: "AdamW"
+  learning_rate: 0.001
+
+# Optional: class weights for imbalanced datasets
+class_weights:
+  class_percentages: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.0, 1.0]
+

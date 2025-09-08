@@ -1,0 +1,39 @@
+paths:
+  mesh_dir: "path/to/train/meshes"
+  label_dir: "path/to/train/labels"
+  log_dir: "path/to/logs/downstream"
+  checkpoint_dir: "path/to/checkpoints/downstream"
+  val_mesh_dir: "path/to/val/meshes"
+  val_label_dir: "path/to/val/labels"
+
+masking:
+  ratio_range: [0.3, 0.7]
+  clusters_to_select: 10
+
+training:
+  epochs: 50
+  batch_size: 16
+  clusters_per_batch: 8
+  learning_rate: 0.001
+  accumulation_steps: 32
+  resume: false
+  ignore_index: -100
+
+model:
+  feature_dim: 256
+  embedding_dim: 512
+  num_heads: 8
+  num_attention_blocks: 6
+  n_classes: 7  # Number of classes for your classification task
+  n_clusters: 8
+  use_pe: true
+  gradinat_ac: true
+  dropout: 0.1
+
+optimizer:
+  type: "adamw"
+  learning_rate: 0.001
+  start_lr: 0.0001
+
+augmentation:
+  mode: "standard" 
