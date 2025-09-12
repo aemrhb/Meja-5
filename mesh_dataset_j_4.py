@@ -203,10 +203,12 @@ class MeshDataset(Dataset):
                              (batch_idx+1) * self.clusters_per_batch]
 
         nested_list_faces = []
-        nested_list_face_indices = []
+        nested_list_face_indices = []  # vertex triplets for adjacency/masking
+        nested_list_face_ids = []      # original face indices for mapping back
         for cl in selected:
             feats = []
-            indices = []
+            indices_triplets = []
+            indices_ids = []
             for face in cl:
                 # look up the original face-index in O(1) instead of searching:
                 fid = face_to_index[tuple(face)]
@@ -218,13 +220,17 @@ class MeshDataset(Dataset):
                 face_feats = np.concatenate(face_feats).tolist()
                 face_feats.append(face_areas[fid])
                 feats.append(face_feats)
-                indices.append(face)  # face is the (v0, v1, v2) triplet
+                # keep both: vertex triplets (for masking) and original face id (for mapping)
+                indices_triplets.append(face)
+                indices_ids.append(fid)
             nested_list_faces.append(torch.tensor(feats))
-            nested_list_face_indices.append(torch.tensor(indices))
+            nested_list_face_indices.append(torch.tensor(indices_triplets))
+            nested_list_face_ids.append(torch.tensor(indices_ids, dtype=torch.long))
 
         if self.transform:
             nested_list_faces = self.transform(nested_list_faces)
-        return nested_list_faces, nested_list_face_indices
+        # return triple for richer downstream use; maintain order
+        return nested_list_faces, nested_list_face_indices, nested_list_face_ids
 
 
 
@@ -255,7 +261,7 @@ def custom_collate_fn(batch, masking_ratio_range=(0.3, 0.7), clusters_to_select=
     prediction_masks_blocks = []    # List of prediction mask blocks per sample
     added_token_masks = []   # Mask that flags added (padded) tokens
 
-    for clusters, clusters_face_indices in batch:
+    for clusters, clusters_face_indices, clusters_face_ids in batch:
         num_clusters = len(clusters)
         clusters_to_sample = min(clusters_to_select, num_clusters)
         selected_clusters = np.random.choice(num_clusters, clusters_to_sample, replace=False)
@@ -266,7 +272,7 @@ def custom_collate_fn(batch, masking_ratio_range=(0.3, 0.7), clusters_to_select=
         for cluster_idx, (cluster, cluster_face_indices) in enumerate(zip(clusters, clusters_face_indices)):
             num_faces = cluster.size(0)
             if cluster_idx in selected_clusters:
-                cluster_face_indices_np = cluster_face_indices.numpy()  # shape [F, 3]
+                cluster_face_indices_np = cluster_face_indices.numpy()  # shape [F, 3] vertex ids
                 mask_fraction = np.random.uniform(*masking_ratio_range)
                 num_faces_to_mask = max(1, int(num_faces * mask_fraction))
                 face_neighbors = get_adjacent_faces(cluster_face_indices_np)

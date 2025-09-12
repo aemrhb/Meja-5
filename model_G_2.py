@@ -473,7 +473,8 @@ class GlobalOnlyMultiHeadAttention(nn.Module):
                     print("  pre_norm local_share_per_feature:", local_share_pre.tolist())
             output = (1 - gate) * padded_batches + gate * expanded_summary
         else:
-            output = padded_batches + expanded_summary
+            # output = padded_batches + expanded_summary
+            output = padded_batches
         
 
         
@@ -493,7 +494,7 @@ class GlobalOnlyTransformerBlock(nn.Module):
 
 # ===================== Hierarchical Transformer Block =====================
 class HierarchicalTransformerBlock(nn.Module):
-    def __init__(self, embedding_dim, num_heads, ff_dim, dropout=0.1, summary_mode='cls', use_relative_positional_encoding=False):
+    def __init__(self, embedding_dim, num_heads, ff_dim, dropout=0.1, summary_mode='cls', use_relative_positional_encoding=False, global_only=False):
         """
         Hierarchical processing block that follows the pattern:
         1. Local processing (tokens within clusters interact)
@@ -514,9 +515,25 @@ class HierarchicalTransformerBlock(nn.Module):
         self.feed_forward_2 = FeedForward(embedding_dim, ff_dim, dropout)
         self.feed_forward_3 = FeedForward(embedding_dim, ff_dim, dropout)
 
-    def forward(self, x, masks, sum_token_in=None, positions_3d=None):
+        # If True, this block will only apply global attention stage (skip local stages)
+        self.global_only = global_only
+
+    def forward(self, x, masks, sum_token_in=None, positions_3d=None, force_global_only=False):
         # Store input for final residual connection
         input_residual = x
+        
+        # Optional mode: apply only global attention (useful for enabling this for the first N blocks)
+        if self.global_only or force_global_only:
+            print("Applying global-only attention")
+            B, N, T, D = x.shape
+            # If we have no incoming summary token and summary_mode is 'cls', synthesize a neutral token;
+            # For 'avg' mode the global block computes its own summary, so the value is ignored.
+            if sum_token_in is None:
+                sum_token_in = torch.zeros(B, N, 1, D, device=x.device, dtype=x.dtype)
+            x, final_sum_token = self.global_only_attention(x, sum_token_in, masks, positions_3d=positions_3d)
+            # Apply top-level residual connection
+            x = x + input_residual
+            return x, final_sum_token
         
         # Stage 1: Local attention within clusters
         x, sum_token = self.local_attention_1(x, masks, sum_token_in=sum_token_in, positions_3d=positions_3d)
@@ -572,7 +589,7 @@ class G_L_TransformerBlock(nn.Module):
 
 # ===================== Nomeformer Model =====================
 class nomeformer(nn.Module):
-    def __init__(self, feature_dim, embedding_dim, num_heads, num_attention_blocks, dropout=0.1, summary_mode='cls', use_hierarchical=False, num_hierarchical_stages=1, fourier=False, relative_positional_encoding=False):
+    def __init__(self, feature_dim, embedding_dim, num_heads, num_attention_blocks, dropout=0.1, summary_mode='cls', use_hierarchical=False, num_hierarchical_stages=1, fourier=False, relative_positional_encoding=False, global_only_middle_n=2):
         """
         Args:
             feature_dim: Input feature dimension
@@ -592,6 +609,7 @@ class nomeformer(nn.Module):
         self.num_hierarchical_stages = num_hierarchical_stages
         self.fourier = fourier
         self.relative_positional_encoding = relative_positional_encoding
+        self.global_only_middle_n = max(int(global_only_middle_n), 0)
         
         # Set up embedding layer based on fourier flag
         if self.fourier:
@@ -613,11 +631,31 @@ class nomeformer(nn.Module):
         self.norm = nn.LayerNorm(embedding_dim)
         
         if use_hierarchical: 
-             
-            self.attention_blocks = nn.ModuleList([
-                HierarchicalTransformerBlock(embedding_dim, num_heads, ff_dim, dropout, summary_mode=summary_mode, use_relative_positional_encoding=self.relative_positional_encoding) 
-                for _ in range(num_attention_blocks)
-            ])
+            blocks = []
+            total = num_attention_blocks
+            # Determine which indices should be global-only (middle K if specified)
+            if self.global_only_middle_n > 0 and total > 0:
+                k = min(self.global_only_middle_n, total)
+                start = max((total - k) // 2, 0)
+                end = start + k
+                def is_global_only(idx):
+                    return start <= idx < end
+            else:
+                def is_global_only(idx):
+                    return False
+            for i in range(total):
+                blocks.append(
+                    HierarchicalTransformerBlock(
+                        embedding_dim,
+                        num_heads,
+                        ff_dim,
+                        dropout,
+                        summary_mode=summary_mode,
+                        use_relative_positional_encoding=self.relative_positional_encoding,
+                        global_only=is_global_only(i)
+                    )
+                )
+            self.attention_blocks = nn.ModuleList(blocks)
         else:
             # Stack of original global-local transformer blocks
             self.attention_blocks = nn.ModuleList([
@@ -767,6 +805,7 @@ class NomeformerPredictor(nn.Module):
         dropout=0.1,
         use_hierarchical=False,
         num_hierarchical_stages=1,
+        global_only_middle_n=0,
     ):
         super(NomeformerPredictor, self).__init__()
         # FIXED predictor dimension: half of embed_dim
@@ -802,6 +841,7 @@ class NomeformerPredictor(nn.Module):
         ff_dim = int(2 * predictor_embed_dim)
         self.use_hierarchical = use_hierarchical
         self.num_hierarchical_stages = num_hierarchical_stages
+        self.global_only_middle_n = max(int(global_only_middle_n), 0)
         
         if use_hierarchical:
             if num_hierarchical_stages > 1:
@@ -815,10 +855,28 @@ class NomeformerPredictor(nn.Module):
                 ])
             else:
                 # Use single-stage hierarchical blocks
-                self.attention_blocks = nn.ModuleList([
-                    HierarchicalTransformerBlock(predictor_embed_dim, num_heads, ff_dim, dropout) 
-                    for _ in range(num_attention_blocks)
-                ])
+                blocks = []
+                total = num_attention_blocks
+                if self.global_only_middle_n > 0 and total > 0:
+                    k = min(self.global_only_middle_n, total)
+                    start = max((total - k) // 2, 0)
+                    end = start + k
+                    def is_global_only(idx):
+                        return start <= idx < end
+                else:
+                    def is_global_only(idx):
+                        return False
+                for i in range(total):
+                    blocks.append(
+                        HierarchicalTransformerBlock(
+                            predictor_embed_dim,
+                            num_heads,
+                            ff_dim,
+                            dropout,
+                            global_only=is_global_only(i)
+                        )
+                    )
+                self.attention_blocks = nn.ModuleList(blocks)
         else:
             # Use original G_L blocks
             self.attention_blocks = nn.ModuleList([

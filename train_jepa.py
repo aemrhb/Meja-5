@@ -20,6 +20,11 @@ import copy
 from tools.helper import init_opt
 import math
 import torch.nn.functional as F
+import numpy as np
+import random
+import trimesh
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 # Directory containing mesh files
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Train a model with a given configuration file.')
@@ -58,7 +63,7 @@ faces_per_cluster = config['model']['faces_per_cluster']
 PE = config['model']['use_pe']
 Gradinat_ac = config['model']['gradinat_ac']
 dropout = config['model'].get('dropout', 0.1) 
-
+use_hierarchical = config['model'].get('use_hierarchical', False)
 
 # Load loss weights from config, defaulting to 1.0 if not present
 
@@ -129,7 +134,19 @@ data_loader = DataLoader(
 iterations_per_epoch = len(data_loader)
 print('iterations_per_epoch',iterations_per_epoch)
 # model = nomeformer(feature_dim, embedding_dim, num_heads, num_attention_blocks, N_class)
-context_encoder = nomeformer(feature_dim, embedding_dim, num_heads, num_attention_blocks, dropout).to(device)
+# context_encoder = nomeformer(feature_dim, embedding_dim, num_heads, num_attention_blocks, dropout).to(device)
+context_encoder = nomeformer(
+    feature_dim=feature_dim,            # your input feature size
+    embedding_dim=embedding_dim,
+    num_heads=2,
+    num_attention_blocks=num_attention_blocks,
+    dropout=dropout,
+    summary_mode='cls',       # or 'avg'
+    use_hierarchical=use_hierarchical,    # or False
+    num_hierarchical_stages=1,
+    fourier=False,             # keep as you use now
+    relative_positional_encoding=False  # <-- activate RPE
+).to(device)
 context_predictor = NomeformerPredictor(feature_dim, embedding_dim, num_heads, num_attention_blocks_perdictor, dropout).to(device)
 # Create the target encoder as a deep copy of the model
 target_encoder = copy.deepcopy(context_encoder).to(device)
@@ -157,6 +174,102 @@ def update_target_encoder(model, target_encoder, momentum=base_momentum ):
             param_k.data.mul_(momentum).add_((1.0 - momentum) * param_q.data)
 #print(f"Number of parameters in the model: {num_params}")
 print('Training_epochs',Training_epochs)
+
+# ===== PCA coloring utilities =====
+def _pca_to_rgb(features_np):
+    scaler = StandardScaler()
+    X = scaler.fit_transform(features_np)
+    pcs3 = PCA(n_components=3, random_state=0).fit_transform(X)
+    mins = pcs3.min(axis=0, keepdims=True)
+    maxs = pcs3.max(axis=0, keepdims=True)
+    denom = np.clip(maxs - mins, 1e-8, None)
+    pcs01 = (pcs3 - mins) / denom
+    colors = (pcs01 * 255.0).clip(0, 255).astype(np.uint8)
+    rgba = np.concatenate([colors, 255*np.ones((colors.shape[0], 1), dtype=np.uint8)], axis=1)
+    return rgba
+
+@torch.no_grad()
+def visualize_random_mesh_pca(target_encoder, mesh_dir, save_root, device, faces_per_cluster, clusters_per_batch, use_pe: bool, n_clusters_fixed: int = None):
+    os.makedirs(save_root, exist_ok=True)
+    # choose a random mesh file
+    candidates = [f for f in os.listdir(mesh_dir) if f.endswith(('.obj', '.ply', '.off'))]
+    if not candidates:
+        print('No mesh files found for PCA visualization.')
+        return
+    fname = random.choice(candidates)
+    mesh_path = os.path.join(mesh_dir, fname)
+    mesh = trimesh.load(mesh_path, force='mesh')
+
+    # Build a dataset instance to iterate cluster slices and recover face indices
+    from mesh_dataset_j_4 import MeshDataset as VisDataset
+    vis_ds = VisDataset(
+        mesh_dir=mesh_dir,
+        clusters_per_batch=clusters_per_batch,
+        faces_per_cluster=faces_per_cluster,
+        PE=use_pe,
+        augmentation=None,
+        transform=None,
+        flexible_num_clusters=(n_clusters_fixed is None),
+        n_clusters=n_clusters_fixed if n_clusters_fixed is not None else None,
+    )
+
+    # collect features per original face index
+    num_faces = mesh.faces.shape[0]
+    feature_dim_accum = None
+    face_features = [None] * num_faces  # list of np arrays
+
+    for idx in range(len(vis_ds)):
+        clusters, cluster_face_ids = vis_ds[idx]
+        # pack to tensor like training and build a full-visible mask
+        max_seq = max(cl.size(0) for cl in clusters)
+        feat_dim = clusters[0].size(1)
+        if feature_dim_accum is None:
+            feature_dim_accum = feat_dim
+        # B=1, P=len(clusters), S=max_seq, F=feat_dim
+        padded_data = [
+            F.pad(cl, (0, 0, 0, max_seq - cl.size(0))) for cl in clusters
+        ]
+        batch_tensor = torch.stack(padded_data).unsqueeze(0).to(device)
+        # masks: all true for real tokens; padded are false
+        enc_masks = []
+        for cl in clusters:
+            mask = torch.zeros(max_seq, dtype=torch.bool)
+            mask[:cl.size(0)] = True
+            enc_masks.append(mask)
+        enc_masks += [torch.zeros(max_seq, dtype=torch.bool)] * (len(padded_data) - len(clusters))
+        encoder_mask = torch.stack(enc_masks).unsqueeze(0).to(device)
+
+        # run encoder
+        enc_out = target_encoder(batch_tensor, encoder_mask)  # [1,P,S,D]
+        enc_np = enc_out.squeeze(0).cpu().numpy()
+
+        # scatter back per real face
+        for p, (cl, ids) in enumerate(zip(clusters, cluster_face_ids)):
+            real_len = cl.size(0)
+            for j in range(real_len):
+                fid = int(ids[j].item())
+                face_features[fid] = enc_np[p, j, :]
+
+    # filter out any None (in case of inconsistencies)
+    face_features_np = np.array([f for f in face_features if f is not None])
+    if face_features_np.shape[0] != num_faces:
+        print(f"Warning: collected {face_features_np.shape[0]} features, expected {num_faces}.")
+    rgba = _pca_to_rgb(face_features_np)
+
+    # assign per-face colors
+    if rgba.shape[0] != mesh.faces.shape[0]:
+        raise ValueError(f"Face color count ({rgba.shape[0]}) != num faces ({mesh.faces.shape[0]})")
+
+    else:
+        face_rgba = rgba
+    mesh.visual.face_colors = face_rgba
+
+    out_dir = os.path.join(save_root)
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(fname))[0]
+    out_path = os.path.join(out_dir, f"{base}_pca_colored.ply")
+    mesh.export(out_path)
+    print(f"Saved PCA-colored mesh to {out_path}")
 
 if optimize_target:
     # include target_encoder parameters
@@ -653,6 +766,26 @@ for epoch in range(start_epoch, Training_epochs):
             plt.savefig(fig_path)
             plt.close()
 
+
+        # # Every 10 epochs: visualize PCA coloring on a random mesh and save
+        # if (epoch + 1) % 1 == 0:
+        #     save_root = os.path.join(checkpoint_dir, 'pca_visuals', f'epoch_{epoch + 1}')
+        #     prev_mode = target_encoder.training
+        #     target_encoder.eval()
+        #     try:
+        #         visualize_random_mesh_pca(
+        #             target_encoder=target_encoder,
+        #             mesh_dir=mesh_dir,
+        #             save_root=save_root,
+        #             device=device,
+        #             faces_per_cluster=faces_per_cluster,
+        #             clusters_per_batch=clusters_per_batch,
+        #             use_pe=PE,
+        #             n_clusters_fixed=n_clusters,
+        #         )
+        #     finally:
+        #         if prev_mode:
+        #             target_encoder.train()
 
 print('Training complete')
 # Close the TensorBoard writer

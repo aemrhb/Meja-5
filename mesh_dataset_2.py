@@ -129,7 +129,7 @@ class MeshDataset(Dataset):
         augmentation (callable, optional): Augmentation function to apply to meshes.
         transform (callable, optional): Optional transform to apply to samples.
     """
-    def __init__(self, mesh_dir, label_dir, n_clusters, clusters_per_batch, PE, json_dir=None, augmentation=None, transform=None):
+    def __init__(self, mesh_dir, label_dir, n_clusters, clusters_per_batch, PE, json_dir=None, augmentation=None, transform=None, include_normals=True, additional_geometrical_features=False):
         self.mesh_dir = mesh_dir
         self.label_dir = label_dir
         self.json_dir = json_dir
@@ -139,6 +139,8 @@ class MeshDataset(Dataset):
         self.transform = transform
         self.PE = PE
         self.augmentation = augmentation
+        self.include_normals = include_normals
+        self.AGF = additional_geometrical_features
 
         # Caching setup
         self.cache_dir = os.path.join(mesh_dir, ".cluster_cache")
@@ -221,19 +223,21 @@ class MeshDataset(Dataset):
         # KMeans clustering on vertices
         kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init='auto')
         labels = kmeans.fit_predict(vertices)
-        
+
         # Compute cluster centroids and reorder for consistency
         centroids = compute_cluster_centroids(vertices, labels, self.n_clusters)
         reorder_indices = reorder_clusters_by_proximity(centroids)
-        
-        # Reorder clusters based on proximity
+        centroids_reordered = centroids[reorder_indices]
+
+        # Reorder clusters based on proximity and assign faces to clusters
         clusters = [[] for _ in range(self.n_clusters)]
+        face_cluster_indices = []
         for face in faces:
             face_cluster = labels[face]
             most_common_cluster = np.bincount(face_cluster).argmax()
-            # Map to reordered cluster index
             reordered_cluster = reorder_indices[most_common_cluster]
             clusters[reordered_cluster].append(face)
+            face_cluster_indices.append(reordered_cluster)
 
         mesh_normals = mesh.face_normals[unique_face_indices]
         mesh_area = mesh.area_faces[unique_face_indices]
@@ -244,21 +248,70 @@ class MeshDataset(Dataset):
         min_area = mesh_area.min()
         max_area = mesh_area.max()
         mesh_area = (mesh_area - min_area) / (max_area - min_area)
-        precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+        # Precompute coords relative to cluster centroids
+        precomputed_coords = []
+        for i, face in enumerate(faces):
+            cluster_idx = face_cluster_indices[i]
+            cluster_centroid = centroids_reordered[cluster_idx]
+            rel = (vertices[face] - cluster_centroid).flatten().tolist()
+            precomputed_coords.append(rel)
         face_to_index = {tuple(face): i for i, face in enumerate(faces)}
+
+        # Additional geometrical features (slope, height, roughness)
+        add_slope = None
+        add_height = None
+        add_roughness = None
+        if getattr(self, 'AGF', False):
+            face_centroids = vertices[faces].mean(axis=1)
+            nz = np.clip(np.abs(mesh_normals[:, 2]), 0.0, 1.0)
+            slope = np.arccos(nz)
+            z_vals = vertices[:, 2]
+            z_thresh = np.percentile(z_vals, 5.0)
+            ground_pts = vertices[z_vals <= z_thresh]
+            if ground_pts.shape[0] >= 3:
+                gp_mean = ground_pts.mean(axis=0)
+                gp_centered = ground_pts - gp_mean
+                cov = gp_centered.T @ gp_centered / max(ground_pts.shape[0] - 1, 1)
+                evals, evecs = np.linalg.eigh(cov)
+                n = evecs[:, np.argmin(evals)]
+                if n[2] < 0:
+                    n = -n
+                n = n / (np.linalg.norm(n) + 1e-12)
+                d = -np.dot(n, gp_mean)
+                norm_height = face_centroids @ n + d
+            else:
+                z_min = z_vals.min()
+                norm_height = face_centroids[:, 2] - z_min
+            from scipy.spatial.distance import cdist as _cdist
+            bbox_diag = float(np.linalg.norm(max_coords - min_coords))
+            radius = 0.05 * bbox_diag if bbox_diag > 0 else 0.05
+            dmat = _cdist(face_centroids, face_centroids)
+            rough = np.zeros(len(face_centroids), dtype=np.float32)
+            for i in range(len(face_centroids)):
+                neigh = np.where(dmat[i] <= radius)[0]
+                if neigh.size <= 1:
+                    rough[i] = 0.0
+                else:
+                    rough[i] = float(np.std(norm_height[neigh]))
+            add_slope = slope
+            add_height = norm_height
+            add_roughness = rough
 
         payload = {
             'clusters': clusters,
             'mesh_angle': mesh_angle,
-            'mesh_normals': mesh_normals,
+            'mesh_normals': mesh_normals if self.include_normals else None,
             'mesh_area': mesh_area,
             'precomputed_coords': precomputed_coords,
             'face_to_index': face_to_index,
-            'face_labels': face_labels
+            'face_labels': face_labels,
+            'add_slope': add_slope,
+            'add_height': add_height,
+            'add_roughness': add_roughness
         }
         cache_file = os.path.join(
             self.cache_dir,
-            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}.pkl"
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}.pkl"
         )
         fd, tmp_path = tempfile.mkstemp(dir=self.cache_dir)
         with os.fdopen(fd, 'wb') as tmpf:
@@ -284,7 +337,7 @@ class MeshDataset(Dataset):
         label_file_name = os.path.splitext(mesh_file)[0]
         cache_file = os.path.join(
             self.cache_dir,
-            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}.pkl"
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}.pkl"
         )
         use_cache = self.augmentation is None  # Only cache un-augmented
         if use_cache:
@@ -309,11 +362,14 @@ class MeshDataset(Dataset):
             cache = self._in_memory_cache[mesh_path]
             clusters = cache['clusters']
             mesh_angle = cache['mesh_angle']
-            mesh_normals = cache['mesh_normals']
+            mesh_normals = cache.get('mesh_normals', None)
             mesh_area = cache['mesh_area']
             precomputed_coords = cache['precomputed_coords']
             face_to_index = cache['face_to_index']
             face_labels = cache['face_labels']
+            add_slope = cache.get('add_slope', None)
+            add_height = cache.get('add_height', None)
+            add_roughness = cache.get('add_roughness', None)
         else:
             # If augmentation is used, recompute on the fly
             mesh = trimesh.load(mesh_path, force='mesh')
@@ -344,20 +400,22 @@ class MeshDataset(Dataset):
             unique_faces = np.array(unique_faces)
             kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init='auto')
             labels = kmeans.fit_predict(vertices)
-            
+
             # Compute cluster centroids and reorder for consistency
             centroids = compute_cluster_centroids(vertices, labels, self.n_clusters)
             reorder_indices = reorder_clusters_by_proximity(centroids)
-            
-            # Reorder clusters based on proximity
+            centroids_reordered = centroids[reorder_indices]
+
+            # Reorder clusters based on proximity and assign faces to clusters
             clusters = [[] for _ in range(self.n_clusters)]
+            face_cluster_indices = []
             for face in faces:
                 face_cluster = labels[face]
                 most_common_cluster = np.bincount(face_cluster).argmax()
-                # Map to reordered cluster index
                 reordered_cluster = reorder_indices[most_common_cluster]
                 clusters[reordered_cluster].append(face)
-            mesh_normals = mesh.face_normals[unique_face_indices]
+                face_cluster_indices.append(reordered_cluster)
+            mesh_normals = mesh.face_normals[unique_face_indices] if self.include_normals else None
             mesh_area = mesh.area_faces[unique_face_indices]
             mesh_angle = mesh.face_angles[unique_face_indices]
             min_angle = mesh_angle.min()
@@ -366,8 +424,56 @@ class MeshDataset(Dataset):
             min_area = mesh_area.min()
             max_area = mesh_area.max()
             mesh_area = (mesh_area - min_area) / (max_area - min_area)
-            precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+            # Precompute coords relative to cluster centroids
+            precomputed_coords = []
+            for i, face in enumerate(faces):
+                cluster_idx = face_cluster_indices[i]
+                cluster_centroid = centroids_reordered[cluster_idx]
+                rel = (vertices[face] - cluster_centroid).flatten().tolist()
+                precomputed_coords.append(rel)
             face_to_index = {tuple(face): i for i, face in enumerate(faces)}
+            # Additional geometrical features (slope, height, roughness)
+            add_slope = None
+            add_height = None
+            add_roughness = None
+            if getattr(self, 'AGF', False):
+                face_centroids = vertices[faces].mean(axis=1)
+                if self.include_normals and mesh_normals is not None:
+                    nz = np.clip(np.abs(mesh_normals[:, 2]), 0.0, 1.0)
+                else:
+                    nz = np.clip(np.abs(mesh.face_normals[unique_face_indices][:, 2]), 0.0, 1.0)
+                slope = np.arccos(nz)
+                z_vals = vertices[:, 2]
+                z_thresh = np.percentile(z_vals, 5.0)
+                ground_pts = vertices[z_vals <= z_thresh]
+                if ground_pts.shape[0] >= 3:
+                    gp_mean = ground_pts.mean(axis=0)
+                    gp_centered = ground_pts - gp_mean
+                    cov = gp_centered.T @ gp_centered / max(ground_pts.shape[0] - 1, 1)
+                    evals, evecs = np.linalg.eigh(cov)
+                    n = evecs[:, np.argmin(evals)]
+                    if n[2] < 0:
+                        n = -n
+                    n = n / (np.linalg.norm(n) + 1e-12)
+                    d = -np.dot(n, gp_mean)
+                    norm_height = face_centroids @ n + d
+                else:
+                    z_min = z_vals.min()
+                    norm_height = face_centroids[:, 2] - z_min
+                from scipy.spatial.distance import cdist as _cdist
+                bbox_diag = float(np.linalg.norm(max_coords - min_coords))
+                radius = 0.05 * bbox_diag if bbox_diag > 0 else 0.05
+                dmat = _cdist(face_centroids, face_centroids)
+                rough = np.zeros(len(face_centroids), dtype=np.float32)
+                for i in range(len(face_centroids)):
+                    neigh = np.where(dmat[i] <= radius)[0]
+                    if neigh.size <= 1:
+                        rough[i] = 0.0
+                    else:
+                        rough[i] = float(np.std(norm_height[neigh]))
+                add_slope = slope
+                add_height = norm_height
+                add_roughness = rough
         start_cluster = cluster_batch_idx * self.clusters_per_batch
         end_cluster = start_cluster + self.clusters_per_batch
         selected_clusters = clusters[start_cluster:end_cluster]
@@ -383,7 +489,12 @@ class MeshDataset(Dataset):
                     coords = precomputed_coords[face_idx]
                     face_features.append(coords)
                 face_features.append(mesh_angle[face_idx])
-                face_features.append(mesh_normals[face_idx])
+                if self.include_normals and mesh_normals is not None:
+                    face_features.append(mesh_normals[face_idx])
+                if getattr(self, 'AGF', False) and (add_slope is not None):
+                    face_features.append([add_slope[face_idx]])
+                    face_features.append([add_height[face_idx]])
+                    face_features.append([add_roughness[face_idx]])
                 face_features = np.concatenate(face_features).tolist()
                 face_features.append(mesh_area[face_idx])
                 label = face_labels[face_idx]

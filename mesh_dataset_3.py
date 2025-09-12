@@ -258,11 +258,35 @@ class MeshDataset(Dataset):
         angles  = mesh.face_angles
         areas   = mesh.area_faces
 
-        # normalize vertex coords to [0,1] then flatten per face for PE
-        min_c, max_c = verts.min(0), verts.max(0)
-        denom = np.where((max_c - min_c) == 0, 1.0, (max_c - min_c))
-        norm_verts = (verts - min_c) / denom
-        precomp_coords = [norm_verts[f].flatten() for f in faces]
+        # normalize vertex coords relative to cluster centers then flatten per face for PE
+        precomp_coords = []
+        for face in faces:
+            # Find which cluster this face belongs to
+            face_centroid = verts[face].mean(axis=0)
+            cluster_idx = None
+            for i, cluster in enumerate(clusters):
+                for cluster_face in cluster:
+                    if np.array_equal(face, cluster_face):
+                        cluster_idx = i
+                        break
+                if cluster_idx is not None:
+                    break
+            
+            if cluster_idx is not None:
+                # Get cluster centroid
+                cluster_centroid = centroids[cluster_idx]
+                # Normalize face vertices relative to cluster centroid
+                cluster_verts = verts[face] - cluster_centroid
+                # Scale to [0,1] range (using a fixed scale factor to maintain relative distances)
+                scale_factor = 1.0  # You can adjust this if needed
+                norm_face_verts = cluster_verts * scale_factor
+                precomp_coords.append(norm_face_verts.flatten())
+            else:
+                # Fallback to original mesh normalization if cluster not found
+                min_c, max_c = verts.min(0), verts.max(0)
+                denom = np.where((max_c - min_c) == 0, 1.0, (max_c - min_c))
+                norm_verts = (verts - min_c) / denom
+                precomp_coords.append(norm_verts[face].flatten())
 
         # additional geometrical features (per-face)
         add_slope = None
@@ -409,10 +433,35 @@ class MeshDataset(Dataset):
             normals = mesh.face_normals
             angles  = mesh.face_angles
             areas   = mesh.area_faces
-            min_c, max_c = verts.min(0), verts.max(0)
-            denom = np.where((max_c - min_c) == 0, 1.0, (max_c - min_c))
-            norm_verts = (verts - min_c) / denom
-            precomp_coords = [norm_verts[f].flatten() for f in faces]
+            # normalize vertex coords relative to cluster centers then flatten per face for PE
+            precomp_coords = []
+            for face in faces:
+                # Find which cluster this face belongs to
+                face_centroid = verts[face].mean(axis=0)
+                cluster_idx = None
+                for i, cluster in enumerate(clusters):
+                    for cluster_face in cluster:
+                        if np.array_equal(face, cluster_face):
+                            cluster_idx = i
+                            break
+                    if cluster_idx is not None:
+                        break
+                
+                if cluster_idx is not None:
+                    # Get cluster centroid
+                    cluster_centroid = centroids[cluster_idx]
+                    # Normalize face vertices relative to cluster centroid
+                    cluster_verts = verts[face] - cluster_centroid
+                    # Scale to [0,1] range (using a fixed scale factor to maintain relative distances)
+                    scale_factor = 1.0  # You can adjust this if needed
+                    norm_face_verts = cluster_verts * scale_factor
+                    precomp_coords.append(norm_face_verts.flatten())
+                else:
+                    # Fallback to original mesh normalization if cluster not found
+                    min_c, max_c = verts.min(0), verts.max(0)
+                    denom = np.where((max_c - min_c) == 0, 1.0, (max_c - min_c))
+                    norm_verts = (verts - min_c) / denom
+                    precomp_coords.append(norm_verts[face].flatten())
             # additional geometrical features
             add_slope = None
             add_height = None
