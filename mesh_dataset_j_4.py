@@ -42,7 +42,7 @@ def reorder_clusters_by_proximity(centroids):
     return ordered
 
 class MeshDataset(Dataset):
-    def __init__(self, mesh_dir, clusters_per_batch, faces_per_cluster=200,
+    def __init__(self, mesh_dir, clusters_per_batch, faces_per_cluster=0,
                  PE=True, augmentation=None, transform=None, 
                  flexible_num_clusters=False, n_clusters=None):
         self.mesh_dir = mesh_dir

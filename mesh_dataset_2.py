@@ -11,6 +11,7 @@ import pickle
 import tempfile
 from scipy.spatial.distance import cdist
 from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.spatial import cKDTree
 
 # ---------- helpers: clustering like your first code ----------
 def compute_cluster_centroids(vertices, labels, n_clusters):
@@ -129,7 +130,7 @@ class MeshDataset(Dataset):
         augmentation (callable, optional): Augmentation function to apply to meshes.
         transform (callable, optional): Optional transform to apply to samples.
     """
-    def __init__(self, mesh_dir, label_dir, n_clusters, clusters_per_batch, PE, json_dir=None, augmentation=None, transform=None, include_normals=True, additional_geometrical_features=False):
+    def __init__(self, mesh_dir, label_dir, n_clusters, clusters_per_batch, PE, json_dir=None, augmentation=None, transform=None, include_normals=True, additional_geometrical_features=False, coords_use_cluster_center=False, pe_bbox_normalized=True):
         self.mesh_dir = mesh_dir
         self.label_dir = label_dir
         self.json_dir = json_dir
@@ -141,6 +142,8 @@ class MeshDataset(Dataset):
         self.augmentation = augmentation
         self.include_normals = include_normals
         self.AGF = additional_geometrical_features
+        self.coords_use_cluster_center = coords_use_cluster_center
+        self.pe_bbox_normalized = pe_bbox_normalized
 
         # Caching setup
         self.cache_dir = os.path.join(mesh_dir, ".cluster_cache")
@@ -248,13 +251,24 @@ class MeshDataset(Dataset):
         min_area = mesh_area.min()
         max_area = mesh_area.max()
         mesh_area = (mesh_area - min_area) / (max_area - min_area)
-        # Precompute coords relative to cluster centroids
-        precomputed_coords = []
-        for i, face in enumerate(faces):
-            cluster_idx = face_cluster_indices[i]
-            cluster_centroid = centroids_reordered[cluster_idx]
-            rel = (vertices[face] - cluster_centroid).flatten().tolist()
-            precomputed_coords.append(rel)
+        # Precompute coords for PE
+        if self.pe_bbox_normalized:
+            precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+        else:
+            # Relative to either cluster center or mesh center
+            precomputed_coords = []
+            if self.coords_use_cluster_center:
+                for i, face in enumerate(faces):
+                    cluster_idx = face_cluster_indices[i]
+                    center = centroids_reordered[cluster_idx]
+                    rel = (vertices[face] - center).flatten().tolist()
+                    precomputed_coords.append(rel)
+            else:
+                print("Using mesh center")
+                mesh_center = mesh.centroid if hasattr(mesh, 'centroid') else vertices.mean(axis=0)
+                for _, face in enumerate(faces):
+                    rel = (vertices[face] - mesh_center).flatten().tolist()
+                    precomputed_coords.append(rel)
         face_to_index = {tuple(face): i for i, face in enumerate(faces)}
 
         # Additional geometrical features (slope, height, roughness)
@@ -282,14 +296,15 @@ class MeshDataset(Dataset):
             else:
                 z_min = z_vals.min()
                 norm_height = face_centroids[:, 2] - z_min
-            from scipy.spatial.distance import cdist as _cdist
             bbox_diag = float(np.linalg.norm(max_coords - min_coords))
             radius = 0.05 * bbox_diag if bbox_diag > 0 else 0.05
-            dmat = _cdist(face_centroids, face_centroids)
+            # Memory-efficient neighborhood via KD-tree
+            tree = cKDTree(face_centroids)
             rough = np.zeros(len(face_centroids), dtype=np.float32)
+            # Iterate in chunks to avoid Python overhead for extreme sizes
             for i in range(len(face_centroids)):
-                neigh = np.where(dmat[i] <= radius)[0]
-                if neigh.size <= 1:
+                neigh = tree.query_ball_point(face_centroids[i], r=radius)
+                if len(neigh) <= 1:
                     rough[i] = 0.0
                 else:
                     rough[i] = float(np.std(norm_height[neigh]))
@@ -311,7 +326,7 @@ class MeshDataset(Dataset):
         }
         cache_file = os.path.join(
             self.cache_dir,
-            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}.pkl"
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}_CC{int(self.coords_use_cluster_center)}_PEBN{int(self.pe_bbox_normalized)}.pkl"
         )
         fd, tmp_path = tempfile.mkstemp(dir=self.cache_dir)
         with os.fdopen(fd, 'wb') as tmpf:
@@ -337,7 +352,7 @@ class MeshDataset(Dataset):
         label_file_name = os.path.splitext(mesh_file)[0]
         cache_file = os.path.join(
             self.cache_dir,
-            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}.pkl"
+            f"{os.path.basename(mesh_path)}__clusters{self.n_clusters}_PE{int(self.PE)}_NORM{int(self.include_normals)}_AGF{int(self.AGF)}_CC{int(self.coords_use_cluster_center)}_PEBN{int(self.pe_bbox_normalized)}.pkl"
         )
         use_cache = self.augmentation is None  # Only cache un-augmented
         if use_cache:
@@ -424,13 +439,23 @@ class MeshDataset(Dataset):
             min_area = mesh_area.min()
             max_area = mesh_area.max()
             mesh_area = (mesh_area - min_area) / (max_area - min_area)
-            # Precompute coords relative to cluster centroids
-            precomputed_coords = []
-            for i, face in enumerate(faces):
-                cluster_idx = face_cluster_indices[i]
-                cluster_centroid = centroids_reordered[cluster_idx]
-                rel = (vertices[face] - cluster_centroid).flatten().tolist()
-                precomputed_coords.append(rel)
+            # Precompute coords for PE
+            if self.pe_bbox_normalized:
+                precomputed_coords = [normalized_vertices[face].flatten().tolist() for face in faces]
+            else:
+                # Relative to either cluster center or mesh center
+                precomputed_coords = []
+                if self.coords_use_cluster_center:
+                    for i, face in enumerate(faces):
+                        cluster_idx = face_cluster_indices[i]
+                        center = centroids_reordered[cluster_idx]
+                        rel = (vertices[face] - center).flatten().tolist()
+                        precomputed_coords.append(rel)
+                else:
+                    mesh_center = mesh.centroid if hasattr(mesh, 'centroid') else vertices.mean(axis=0)
+                    for _, face in enumerate(faces):
+                        rel = (vertices[face] - mesh_center).flatten().tolist()
+                        precomputed_coords.append(rel)
             face_to_index = {tuple(face): i for i, face in enumerate(faces)}
             # Additional geometrical features (slope, height, roughness)
             add_slope = None
@@ -460,14 +485,14 @@ class MeshDataset(Dataset):
                 else:
                     z_min = z_vals.min()
                     norm_height = face_centroids[:, 2] - z_min
-                from scipy.spatial.distance import cdist as _cdist
                 bbox_diag = float(np.linalg.norm(max_coords - min_coords))
                 radius = 0.05 * bbox_diag if bbox_diag > 0 else 0.05
-                dmat = _cdist(face_centroids, face_centroids)
+                # Memory-efficient neighborhood via KD-tree
+                tree = cKDTree(face_centroids)
                 rough = np.zeros(len(face_centroids), dtype=np.float32)
                 for i in range(len(face_centroids)):
-                    neigh = np.where(dmat[i] <= radius)[0]
-                    if neigh.size <= 1:
+                    neigh = tree.query_ball_point(face_centroids[i], r=radius)
+                    if len(neigh) <= 1:
                         rough[i] = 0.0
                     else:
                         rough[i] = float(np.std(norm_height[neigh]))

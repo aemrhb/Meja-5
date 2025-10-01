@@ -77,13 +77,19 @@ class MultiHeadAttention(nn.Module):
             prep = torch.ones(B, N, 1, device=masks.device, dtype=masks.dtype)
             key_keep = torch.cat((prep, masks), dim=-1)  # [B, N, L] 1=valid, 0=masked
             large_neg = torch.finfo(torch.float32).min
-            key_mask = torch.where(key_keep == 0, large_neg, 0.0).view(B * N, 1, 1, L)
+            # Create 2D attention mask: [B*N, 1, L, L]
+            key_mask_1d = torch.where(key_keep == 0, large_neg, 0.0)  # [B, N, L]
+            key_mask = key_mask_1d.view(B * N, 1, 1, L).expand(-1, -1, L, -1)  # [B*N, 1, L, L]
 
             # Reshape to heads: [B*N, H, L, Hd]
             q = q.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
             k = k.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
             v = v.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
-
+            # print('q.shape in local attention', q.shape)
+            # print('k.shape in local attention', k.shape)
+            # print('v.shape in local attention', v.shape)
+            # print('x.shape in local attention', x.shape)
+            # print('key_mask.shape in local attention', key_mask.shape)
             if not self.use_relative_positional_encoding or positions_3d is None:
                 attn = F.scaled_dot_product_attention(q, k, v, attn_mask=key_mask, dropout_p=self.dropout)
             else:
@@ -137,13 +143,15 @@ class MultiHeadAttention(nn.Module):
             k = self.key(x.float())
             v = self.value(x.float())
 
-            # Mask: [B, N, T] -> [B*N, 1, 1, T] (large_neg=masked)
+            # Mask: [B, N, T] -> [B*N, 1, L, L] (large_neg=masked)
             large_neg = torch.finfo(torch.float32).min
-            key_mask = torch.where(masks == 0, large_neg, 0.0).view(B * N, 1, 1, L)
+            key_mask_1d = torch.where(masks == 0, large_neg, 0.0)  # [B, N, L]
+            key_mask = key_mask_1d.view(B * N, 1, 1, L).expand(-1, -1, L, -1)  # [B*N, 1, L, L]
 
             q = q.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
             k = k.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
             v = v.view(B * N, L, H, Hd).permute(0, 2, 1, 3)
+
 
             if not self.use_relative_positional_encoding or positions_3d is None:
                 attn = F.scaled_dot_product_attention(q, k, v, attn_mask=key_mask, dropout_p=self.dropout)
@@ -237,10 +245,16 @@ class GlobalMultiHeadAttention(nn.Module):
         # print('padded_batches.shape in global attention', padded_batches.shape)
         # print('summary_token.shape in global attention', summary_token.shape)
         # Create attention mask for global attention
-        # masks: [B, N, T] -> [B*N, H, T, 1] (large_neg=masked)
+        # masks: [B, N, T] -> [B*N, 1, T, 1] (large_neg=masked)
         large_neg = torch.finfo(torch.float32).min
-        attn_mask = torch.where(masks == 0, large_neg, 0.0).view(B * N, 1, T, 1).expand(-1, H, -1, -1)
-
+        attn_mask = torch.where(masks == 0, large_neg, 0.0).view(B * N, 1, T, 1)
+        # print('attn_mask.shape in global attention', attn_mask.shape)
+        # print('q.shape in global attention', q.shape)
+        # print('k.shape in global attention', k.shape)
+        # print('v.shape in global attention', v.shape)
+        # print('padded_batches.shape in global attention', padded_batches.shape)
+        # print('summary_token.shape in global attention', summary_token.shape)
+        # print('masks.shape in global attention', masks.shape)
         # Perform attention with proper masking
         if not self.use_relative_positional_encoding or positions_3d is None:
             attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout)
@@ -389,9 +403,9 @@ class GlobalOnlyMultiHeadAttention(nn.Module):
         q = q.squeeze(2).view(B, N, H, Hd).permute(0, 2, 1, 3)  # [B, H, N, Hd]
         k = k.squeeze(2).view(B, N, H, Hd).permute(0, 2, 1, 3)  # [B, H, N, Hd]
         v = v.squeeze(2).view(B, N, H, Hd).permute(0, 2, 1, 3)  # [B, H, N, Hd]
-    #    print('q.shape in global-only attention', q.shape)
-    #    print('k.shape in global-only attention', k.shape)
-    #    print('v.shape in global-only attention', v.shape)
+        # print('q.shape in global-only attention', q.shape)
+        # print('k.shape in global-only attention', k.shape)
+        # print('v.shape in global-only attention', v.shape)
         
         # Perform attention (no masking needed for global-only as all summary tokens are valid)
         if not self.use_relative_positional_encoding or positions_3d is None:
@@ -551,7 +565,7 @@ class HierarchicalTransformerBlock(nn.Module):
         
         # Apply hierarchical residual connections
         # Combine information from all stages
-        x = x + input_residual
+        # x = x + input_residual
         
         return x, final_sum_token
 
@@ -631,6 +645,7 @@ class nomeformer(nn.Module):
         self.norm = nn.LayerNorm(embedding_dim)
         
         if use_hierarchical: 
+            print("Using hierarchical transformer blocks")
             blocks = []
             total = num_attention_blocks
             # Determine which indices should be global-only (middle K if specified)

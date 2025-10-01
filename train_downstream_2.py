@@ -5,9 +5,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 from mesh_dataset_2 import MeshDataset, custom_collate_fn  ,MeshAugmentation
+from mesh_texture_dataset import MeshTextureDataset, texture_custom_collate_fn
 from model_G_2 import nomeformer
 from tools.downst import DownstreamClassifier
+from integrated_texture_geometry_model import IntegratedTextureGeometryModel, IntegratedDownstreamClassifier
 from tools.helper import init_opt
 from tools.check_point import save_checkpoint , load_checkpoint
 from tqdm import tqdm
@@ -97,6 +100,10 @@ val_mesh_dir = config['paths']['val_mesh_dir']
 val_label_dir = config['paths']['val_label_dir']
 val_json_dir = config['paths']['val_json_dir']
 
+# Texture-specific paths
+texture_dir = config['paths'].get('texture_dir', None)
+val_texture_dir = config['paths'].get('val_texture_dir', None)
+
 # Training hyperparameters
 Training_epochs = config['training']['epochs']
 batch_size = config['training']['batch_size']
@@ -143,6 +150,13 @@ dropout = config['model'].get('dropout', 0.1)
 include_normals = config['model'].get('include_normals', True)
 additional_geometrical_features = config['model'].get('additional_geometrical_features', False)
 
+# Texture-specific configuration
+use_texture = config['model'].get('use_texture', False)
+texture_embed_dim = config['model'].get('texture_embed_dim', 64)
+fusion_method = config['model'].get('fusion_method', 'gated')
+max_texture_pixels = config['model'].get('max_texture_pixels', 128)
+texture_patch_size = config['model'].get('texture_patch_size', 16)
+
 # ===================== Validation Function =====================
 def evaluate(model, val_data_loader, ema=None):
     """Evaluate the model on the validation set and return metrics."""
@@ -166,13 +180,28 @@ def evaluate(model, val_data_loader, ema=None):
     val_f1_metric.reset()
     val_accuracy_metric.reset()
     with torch.no_grad():
-        for batch, labels, masks in val_data_loader:
-            batch = batch.to(device)
-            labels = labels.to(device)
-            if mesh_dir == '/bigwork/nhgnheid/EU_data_V2/train':
-                labels = labels + 1
-            masks = masks.to(device)
-            output = model(batch, masks)
+        for data in val_data_loader:
+            if use_texture and texture_dir is not None:
+                # Texture dataset returns: (geometry_features, texture_sequences, labels, masks, texture_masks)
+                geometry_features, labels, texture_sequences, masks, texture_masks = data
+                geometry_features = geometry_features.to(device)
+                texture_sequences = texture_sequences.to(device)
+                labels = labels.to(device)
+                if mesh_dir == '/bigwork/nhgnheid/EU_data_V2/train' or mesh_dir == '/bigwork/nhgnheid/EU_data_V3/Train':
+                    labels = labels + 1
+                masks = masks.to(device)
+                texture_masks = texture_masks.to(device)
+                output = model(geometry_features, texture_sequences, masks, texture_masks)
+            else:
+                # Geometry-only dataset returns: (batch, labels, masks)
+                batch, labels, masks = data
+                batch = batch.to(device)
+                if mesh_dir == '/bigwork/nhgnheid/EU_data_V2/train' or mesh_dir == '/bigwork/nhgnheid/EU_data_V3/Train':
+                    labels = labels + 1
+                labels = labels.to(device)
+                masks = masks.to(device)
+                output = model(batch, masks)
+            
             loss = masked_loss_fn(output, labels, masks)
             val_running_loss += loss.item()
             pred = output.reshape(-1, N_class)
@@ -231,6 +260,21 @@ if 'class_weights' in config:
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# ===================== Mixed Precision Setup =====================
+use_mixed_precision = True  # Enable mixed precision training
+scaler = GradScaler() if use_mixed_precision else None
+print(f"🚀 Mixed precision training: {'Enabled' if use_mixed_precision else 'Disabled'}")
+
+# Memory monitoring function
+def monitor_gpu_memory():
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        max_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB
+        print(f"🔍 GPU Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {max_memory:.1f}GB total")
+        return allocated, reserved, max_memory
+    return 0, 0, 0
+
 # ===================== Training Setup =====================
 # Print training configuration
 print(f"Training Configuration:")
@@ -242,37 +286,82 @@ print(f"  - Device: {device}")
 print(f"  - Number of Classes: {N_class}")
 print(f"  - Ignore Index: {ignore_index if ignore_index is not None else 'None (all classes used)'}")
 print(f"  - EMA: {'Enabled' if use_ema else 'Disabled'}")
+print(f"  - Texture Features: {'Enabled' if use_texture else 'Disabled'}")
 if use_ema:
     print(f"  - EMA Decay: {ema_decay}")
+if use_texture:
+    print(f"  - Texture Embed Dim: {texture_embed_dim}")
+    print(f"  - Fusion Method: {fusion_method}")
+    print(f"  - Max Texture Pixels: {max_texture_pixels}")
 
 
-# Instantiate dataset and DataLoader (aligned with updated MeshDataset signature)
-dataset = MeshDataset(
-    mesh_dir=mesh_dir,
-    label_dir=label_dir,
-    n_clusters=n_clusters,
-    clusters_per_batch=clusters_per_batch,
-    PE=PE,
-    json_dir=json_dir,
-    augmentation=None,
-    transform=None,
-    include_normals=include_normals,
-    additional_geometrical_features=additional_geometrical_features,
-)
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
-val_dataset = MeshDataset(
-    mesh_dir=val_mesh_dir,
-    label_dir=val_label_dir,
-    n_clusters=n_clusters,
-    clusters_per_batch=clusters_per_batch,
-    PE=PE,
-    json_dir=val_json_dir,
-    augmentation=None,
-    transform=None,
-    include_normals=include_normals,
-    additional_geometrical_features=additional_geometrical_features,
-)
-val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
+# Instantiate dataset and DataLoader
+if use_texture and texture_dir is not None:
+    print("Using MeshTextureDataset with texture features")
+    dataset = MeshTextureDataset(
+        mesh_dir=mesh_dir,
+        label_dir=label_dir,
+        texture_dir=texture_dir,
+        n_clusters=n_clusters,
+        clusters_per_batch=clusters_per_batch,
+        PE=PE,
+        json_dir=json_dir,
+        augmentation=None,
+        transform=None,
+        include_normals=include_normals,
+        additional_geometrical_features=additional_geometrical_features,
+        texture_patch_size=texture_patch_size,
+        max_texture_pixels=max_texture_pixels,
+        pe_bbox_normalized=True
+    )
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=texture_custom_collate_fn)
+    
+    val_dataset = MeshTextureDataset(
+        mesh_dir=val_mesh_dir,
+        label_dir=val_label_dir,
+        texture_dir=val_texture_dir if val_texture_dir is not None else texture_dir,
+        n_clusters=n_clusters,
+        clusters_per_batch=clusters_per_batch,
+        PE=PE,
+        json_dir=val_json_dir,
+        augmentation=None,
+        transform=None,
+        include_normals=include_normals,
+        additional_geometrical_features=additional_geometrical_features,
+        texture_patch_size=texture_patch_size,
+        max_texture_pixels=max_texture_pixels,
+        pe_bbox_normalized=True
+    )
+    val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=texture_custom_collate_fn)
+else:
+    print("Using MeshDataset with geometry features only")
+    dataset = MeshDataset(
+        mesh_dir=mesh_dir,
+        label_dir=label_dir,
+        n_clusters=n_clusters,
+        clusters_per_batch=clusters_per_batch,
+        PE=PE,
+        json_dir=json_dir,
+        augmentation=None,
+        transform=None,
+        include_normals=include_normals,
+        additional_geometrical_features=additional_geometrical_features,
+    )
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
+    
+    val_dataset = MeshDataset(
+        mesh_dir=val_mesh_dir,
+        label_dir=val_label_dir,
+        n_clusters=n_clusters,
+        clusters_per_batch=clusters_per_batch,
+        PE=PE,
+        json_dir=val_json_dir,
+        augmentation=None,
+        transform=None,
+        include_normals=include_normals,
+        additional_geometrical_features=additional_geometrical_features,
+    )
+    val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
 
 # dataset = MeshDataset(
 #     mesh_dir=mesh_dir,
@@ -310,18 +399,38 @@ val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
 # Load pre-trained encoder
 # For hierarchical processing (optional)
 
-pretrained_encoder = nomeformer(
-    feature_dim=feature_dim,            # your input feature size
-    embedding_dim=embedding_dim,
-    num_heads=num_heads,
-    num_attention_blocks=num_attention_blocks,
-    dropout=dropout,
-    summary_mode='cls',       # or 'avg'
-    use_hierarchical=use_hierarchical,    # or False
-    num_hierarchical_stages=1,
-    fourier=False,             # keep as you use now
-    relative_positional_encoding=False  # <-- activate RPE
-)
+if use_texture and texture_dir is not None:
+    # Create integrated texture-geometry model
+    pretrained_encoder = IntegratedTextureGeometryModel(
+        geometry_feature_dim=feature_dim,
+        embedding_dim=embedding_dim,
+        texture_embed_dim=texture_embed_dim,
+        num_heads=num_heads,
+        num_attention_blocks=num_attention_blocks,
+        dropout=dropout,
+        summary_mode='cls',
+        use_hierarchical=use_hierarchical,
+        fourier=False,
+        relative_positional_encoding=False,
+        fusion_method=fusion_method,
+        max_texture_pixels=max_texture_pixels
+    )
+    print("Created integrated texture-geometry model")
+else:
+    # Create geometry-only model
+    pretrained_encoder = nomeformer(
+        feature_dim=feature_dim,            # your input feature size
+        embedding_dim=embedding_dim,
+        num_heads=num_heads,
+        num_attention_blocks=num_attention_blocks,
+        dropout=dropout,
+        summary_mode='cls',       # or 'avg'
+        use_hierarchical=use_hierarchical,    # or False
+        num_hierarchical_stages=1,
+        fourier=False,             # keep as you use now
+        relative_positional_encoding=False  # <-- activate RPE
+    )
+    print("Created geometry-only model")
 
 # pretrained_encoder = nomeformer(
 #     feature_dim, embedding_dim, num_heads, num_attention_blocks, dropout, 
@@ -330,8 +439,24 @@ pretrained_encoder = nomeformer(
 # Load pre-trained weights
 if use_pretrained and os.path.exists(checkpoint_pertrain):
     checkpoint = torch.load(checkpoint_pertrain, map_location=device)
-    pretrained_encoder.load_state_dict(checkpoint['target_encoder'])
-    print(f"Loaded pretrained encoder from {checkpoint_pertrain}")
+    if use_texture and texture_dir is not None:
+        # For integrated model, try to load geometry encoder weights
+        if 'target_encoder' in checkpoint:
+            # Try to load geometry encoder weights only
+            try:
+                if hasattr(pretrained_encoder, 'geometry_encoder'):
+                    pretrained_encoder.geometry_encoder.load_state_dict(checkpoint['target_encoder'])
+                    print(f"Loaded pretrained geometry encoder from {checkpoint_pertrain}")
+                else:
+                    print("Warning: Integrated model doesn't have geometry_encoder attribute")
+            except Exception as e:
+                print(f"Warning: Could not load geometry encoder weights: {e}")
+        else:
+            print("Warning: No 'target_encoder' key found in checkpoint")
+    else:
+        # For geometry-only model
+        pretrained_encoder.load_state_dict(checkpoint['target_encoder'])
+        print(f"Loaded pretrained encoder from {checkpoint_pertrain}")
 else:
     if use_pretrained:
         print(f"Warning: pretrained checkpoint not found at {checkpoint_pertrain}, proceeding with random init")
@@ -345,8 +470,21 @@ else:
         elif isinstance(m, nn.LayerNorm):
             nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
     pretrained_encoder.apply(_init_enc_weights)
+
 # Create downstream model
-model = DownstreamClassifier(pretrained_encoder, N_class, embedding_dim, dropout, True, num_unfrozen_encoder_layers).to(device)
+if use_texture and texture_dir is not None:
+    model = IntegratedDownstreamClassifier(
+        integrated_encoder=pretrained_encoder,
+        num_classes=N_class,
+        embedding_dim=embedding_dim,
+        dropout=dropout,
+        freeze_encoder_layers=num_unfrozen_encoder_layers,
+        fusion_method=fusion_method
+    ).to(device)
+    print("Created integrated downstream classifier")
+else:
+    model = DownstreamClassifier(pretrained_encoder, N_class, embedding_dim, dropout, True, num_unfrozen_encoder_layers).to(device)
+    print("Created geometry-only downstream classifier")
 if unfreeze_all:
     for p in model.encoder.parameters():
         p.requires_grad = True
@@ -629,28 +767,69 @@ for epoch in range(start_epoch, Training_epochs):
     
     # Training
     with tqdm(total=len(data_loader), desc=f'Epoch {epoch + 1}/{Training_epochs}', unit='batch') as pbar:
-        for i, (batch, labels, masks) in enumerate(data_loader):
-            batch = batch.to(device)
-            masks = masks.to(device)
-            labels = labels.to(device)
-            if mesh_dir == '/bigwork/nhgnheid/EU_data_V2/train':
-                labels = labels + 1
-            print(f"📦 Batch shape: {batch.shape}")
-            optimizer.zero_grad()
-            
-            # Forward pass - get per-face predictions
-            logits = model(batch, masks)  # [B, N, F, num_classes]
+        for i, data in enumerate(data_loader):
+            if use_texture and texture_dir is not None:
+                # Texture dataset returns: (geometry_features, labels, texture_sequences, masks, texture_masks)
+                geometry_features, labels, texture_sequences, masks, texture_masks = data
+
+                geometry_features = geometry_features.to(device)
+                texture_sequences = texture_sequences.to(device)
+                labels = labels.to(device)
+                if mesh_dir == '/bigwork/nhgnheid/EU_data_V2/train' or mesh_dir == '/bigwork/nhgnheid/EU_data_V3/Train':
+                    labels = labels + 1
+                masks = masks.to(device)
+                texture_masks = texture_masks.to(device)
+                print(f"📦 Geometry shape: {geometry_features.shape}, Texture shape: {texture_sequences.shape}")
+                print(f"📦 Texture masks shape: {texture_masks.shape}")
+                print(f"📦 Masks shape: {masks.shape}")
+                print(f"📦 Labels shape: {labels.shape}")
+                optimizer.zero_grad()
+                
+                # Forward pass - get per-face predictions
+                # Clear cache before forward pass to free memory
+                torch.cuda.empty_cache()
+                
+                # Use mixed precision for forward pass
+                if use_mixed_precision:
+                    with autocast():
+                        logits = model(geometry_features, texture_sequences, masks, texture_masks)  # [B, N, F, num_classes]
+                else:
+                    logits = model(geometry_features, texture_sequences, masks, texture_masks)  # [B, N, F, num_classes]
+            else:
+                # Geometry-only dataset returns: (batch, labels, masks)
+                batch, labels, masks = data
+                batch = batch.to(device)
+                masks = masks.to(device)
+                labels = labels.to(device)
+                print(f"📦 Batch shape: {batch.shape}")
+                optimizer.zero_grad()
+                
+                # Forward pass - get per-face predictions with mixed precision
+                if use_mixed_precision:
+                    with autocast():
+                        logits = model(batch, masks)  # [B, N, F, num_classes]
+                else:
+                    logits = model(batch, masks)  # [B, N, F, num_classes]
             
             # Reshape for loss calculation
             B, N, F, num_classes = logits.shape
             
             # Calculate loss (CrossEntropyLoss will ignore -100 labels)
-            loss = masked_loss_fn(logits, labels, masks)
+            if use_mixed_precision:
+                with autocast():
+                    loss = masked_loss_fn(logits, labels, masks)
+            else:
+                loss = masked_loss_fn(logits, labels, masks)
             
-            # Backward pass
-            loss.backward()
-        #    torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), max_norm=1.0)
-            optimizer.step()
+            # Backward pass with mixed precision
+            if use_mixed_precision:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+            #    torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), max_norm=1.0)
+                optimizer.step()
             
             # Update EMA after optimizer step
             if ema is not None:
